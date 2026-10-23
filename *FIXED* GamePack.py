@@ -1,0 +1,2249 @@
+
+import os
+import sys
+import re
+import json
+import hmac
+import math
+import random
+import secrets
+import tarfile
+import tempfile
+import urllib.parse
+import urllib.request
+import zipfile
+import webbrowser
+from datetime import datetime
+from pathlib import Path
+
+from PySide6.QtCore import (
+    Qt, QThread, Signal, QTimer, QUrl,
+    QPropertyAnimation, QEasingCurve
+)
+from PySide6.QtGui import (
+    QPixmap, QImage, QColor, QPainter, QBrush,
+    QRadialGradient, QIcon
+)
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout,
+    QHBoxLayout, QLabel, QPushButton, QStackedWidget,
+    QFrame, QFileDialog, QColorDialog, QComboBox,
+    QCheckBox, QSlider, QLineEdit, QTreeWidget,
+    QTreeWidgetItem, QMessageBox, QInputDialog,
+    QGraphicsOpacityEffect
+)
+
+try:
+    from PySide6.QtMultimedia import (
+        QMediaPlayer, QAudioOutput, QVideoSink
+    )
+    MULTIMEDIA_AVAILABLE = True
+except ImportError:
+    MULTIMEDIA_AVAILABLE = False
+
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+try:
+    from steam_config import API_KEY, USERID
+except ImportError:
+    API_KEY = ""
+    USERID = ""
+
+
+APP_NAME = "GamePack"
+MAGIC = b"GAMEPACK1\n"
+KDF_ITERATIONS = 600_000
+
+
+PASSWORD_CONFIG = Path(
+    r"C:\GamePack (ADMIN)\gamepack_admin_config.json"
+)
+
+
+def load_master_password():
+    try:
+        data = json.loads(
+            PASSWORD_CONFIG.read_text(encoding="utf-8")
+        )
+        if not isinstance(data, dict):
+            return ""
+
+        password = data.get("password", "")
+        return password if isinstance(password, str) else ""
+
+    except (OSError, ValueError, AttributeError):
+        return ""
+
+
+DATA_DIR = Path.home() / ".gamepack"
+CONFIG_FILE = DATA_DIR / "settings.json"
+ART_DIR = DATA_DIR / "artwork"
+IMPORTS_FILE = DATA_DIR / "imported_games.json"
+
+
+def resource_path(filename):
+    """Find a resource beside the script or inside a PyInstaller bundle."""
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        base_path = Path(sys._MEIPASS)
+    else:
+        base_path = Path(__file__).resolve().parent
+    return str(base_path / filename)
+
+
+ICON_PATH = resource_path("gamepack.ico")
+
+DARK = {
+    "bg": "#11131e",
+    "panel": "rgba(23, 27, 43, 220)",
+    "fg": "#f3f5ff",
+    "muted": "#adb6d0",
+    "accent": "#8b75ff",
+}
+
+LIGHT = {
+    "bg": "#edf0fa",
+    "panel": "rgba(255, 255, 255, 225)",
+    "fg": "#20243a",
+    "muted": "#68708a",
+    "accent": "#6655dc",
+}
+
+
+# ---------------------------------------------------------
+# Settings, catalog storage, and encryption
+# ---------------------------------------------------------
+
+def load_settings():
+    try:
+        result = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        return result if isinstance(result, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(settings):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(
+        json.dumps(settings, indent=2),
+        encoding="utf-8"
+    )
+
+
+def load_imported_games():
+    try:
+        data = json.loads(IMPORTS_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def save_imported_games(games):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    IMPORTS_FILE.write_text(
+        json.dumps(games, indent=2, ensure_ascii=False),
+        encoding="utf-8"
+    )
+
+
+def derive_key(password, salt):
+    return PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=salt,
+        iterations=KDF_ITERATIONS,
+    ).derive(password.encode("utf-8"))
+
+
+def encrypt_bytes(data, password):
+    salt = secrets.token_bytes(16)
+    nonce = secrets.token_bytes(12)
+    key = derive_key(password, salt)
+    ciphertext = AESGCM(key).encrypt(nonce, data, MAGIC)
+    return MAGIC + salt + nonce + ciphertext
+
+
+def decrypt_bytes(blob, password):
+    header = len(MAGIC)
+
+    if not blob.startswith(MAGIC) or len(blob) < header + 44:
+        raise ValueError("Invalid GamePack archive.")
+
+    salt = blob[header:header + 16]
+    nonce = blob[header + 16:header + 28]
+    ciphertext = blob[header + 28:]
+
+    return AESGCM(
+        derive_key(password, salt)
+    ).decrypt(nonce, ciphertext, MAGIC)
+
+
+def safe_game_name(value):
+    value = re.sub(r'[\x00-\x1f<>:"/\\|?*]', "", str(value))
+    return value.strip()[:160]
+
+
+def extract_steam_appid(text):
+    text = str(text).strip()
+
+    if text.isdigit():
+        return text
+
+    patterns = (
+        r"store\.steampowered\.com/app/(\d+)",
+        r"steamdb\.info/app/(\d+)",
+    )
+
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return match.group(1)
+
+    return None
+
+
+def valid_local_folder(value):
+    if not value:
+        return None
+    try:
+        path = Path(value).expanduser().resolve()
+        return path if path.is_dir() else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+# ---------------------------------------------------------
+# Steam library scanner
+# ---------------------------------------------------------
+
+def steam_roots():
+    candidates = [
+        Path(os.environ.get(
+            "PROGRAMFILES(X86)", r"C:\Program Files (x86)"
+        )) / "Steam",
+        Path(os.environ.get(
+            "PROGRAMFILES", r"C:\Program Files"
+        )) / "Steam",
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Steam",
+    ]
+
+    if os.name == "nt":
+        try:
+            import winreg
+
+            for hive in (
+                winreg.HKEY_CURRENT_USER,
+                winreg.HKEY_LOCAL_MACHINE,
+            ):
+                for key in (
+                    r"Software\Valve\Steam",
+                    r"Software\WOW6432Node\Valve\Steam",
+                ):
+                    try:
+                        with winreg.OpenKey(hive, key) as handle:
+                            value, _ = winreg.QueryValueEx(
+                                handle, "SteamPath"
+                            )
+                            candidates.append(Path(value))
+                    except OSError:
+                        pass
+        except ImportError:
+            pass
+
+    roots = []
+    for root in candidates:
+        try:
+            root = root.resolve()
+            if (root / "steamapps").is_dir() and root not in roots:
+                roots.append(root)
+        except OSError:
+            pass
+
+    return roots
+
+
+def library_dirs():
+    result = []
+
+    for root in steam_roots():
+        candidates = [root / "steamapps"]
+        vdf = root / "steamapps" / "libraryfolders.vdf"
+
+        if vdf.is_file():
+            try:
+                text = vdf.read_text(encoding="utf-8", errors="ignore")
+
+                for match in re.finditer(
+                    r'"(?:path|[0-9]+)"\s*"([^"]+)"', text
+                ):
+                    raw_path = match.group(1).replace("\\\\", "\\")
+                    library_root = Path(raw_path)
+
+                    if library_root.is_absolute():
+                        candidates.append(library_root / "steamapps")
+            except OSError:
+                pass
+
+        for candidate in candidates:
+            try:
+                candidate = candidate.resolve()
+                if candidate.is_dir() and candidate not in result:
+                    result.append(candidate)
+            except OSError:
+                pass
+
+    return result
+
+
+def parse_manifest(path):
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+
+        appid = re.search(r'"appid"\s*"(\d+)"', text)
+        name = re.search(r'"name"\s*"([^"]+)"', text)
+        install = re.search(r'"installdir"\s*"([^"]+)"', text)
+
+        if not appid or not name:
+            return None
+
+        folder_name = install.group(1) if install else name.group(1)
+        folder = path.parent / "common" / folder_name
+
+        return {
+            "appid": appid.group(1),
+            "name": name.group(1),
+            "folder": folder,
+            "available": folder.is_dir(),
+            "owned": False,
+            "catalog_only": False,
+        }
+    except OSError:
+        return None
+
+
+def scan_local_games():
+    games = {}
+
+    for apps in library_dirs():
+        try:
+            manifests = apps.glob("appmanifest_*.acf")
+            for manifest in manifests:
+                game = parse_manifest(manifest)
+                if game:
+                    games[game["appid"]] = game
+        except OSError:
+            pass
+
+    return games
+
+
+# ---------------------------------------------------------
+# Network worker
+# ---------------------------------------------------------
+
+class Worker(QThread):
+    result = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, url):
+        super().__init__()
+        self.url = url
+
+    def run(self):
+        try:
+            request = urllib.request.Request(
+                self.url,
+                headers={"User-Agent": "GamePack/2.1"},
+            )
+            with urllib.request.urlopen(request, timeout=20) as response:
+                self.result.emit(response.read())
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+# ---------------------------------------------------------
+# Animated wallpaper and particles
+# ---------------------------------------------------------
+
+class AnimatedBackground(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        self.image = QPixmap()
+        self.video_frame = QImage()
+        self.effects_enabled = True
+        self.transparent_base = False
+
+        self.particles = [
+            {
+                "x": random.random(),
+                "y": random.random(),
+                "radius": random.uniform(1.0, 2.5),
+                "speed": random.uniform(0.001, 0.004),
+                "phase": random.random() * math.tau,
+            }
+            for _ in range(70)
+        ]
+
+        self.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents, True
+        )
+        self.setAttribute(
+            Qt.WidgetAttribute.WA_NoSystemBackground, True
+        )
+        self.setAttribute(
+            Qt.WidgetAttribute.WA_TranslucentBackground, True
+        )
+
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.animate)
+        self.timer.start(33)
+
+    def set_image(self, path):
+        self.image = QPixmap(path) if path else QPixmap()
+        self.video_frame = QImage()
+        self.update()
+
+    def set_video_frame(self, frame):
+        self.video_frame = frame.copy() if not frame.isNull() else QImage()
+        self.update()
+
+    def set_effects(self, enabled):
+        self.effects_enabled = enabled
+        self.update()
+
+    def animate(self):
+        if not self.effects_enabled:
+            return
+
+        for particle in self.particles:
+            particle["y"] -= particle["speed"]
+            particle["phase"] += 0.05
+            if particle["y"] < -0.02:
+                particle["y"] = 1.02
+                particle["x"] = random.random()
+
+        self.update()
+
+    def paint_wallpaper(self, painter, rect):
+        source = (
+            self.video_frame if not self.video_frame.isNull()
+            else self.image if not self.image.isNull()
+            else None
+        )
+
+        if source is None:
+            painter.fillRect(rect, QColor("#11131e"))
+            return
+
+        if source.size().isEmpty() or rect.isEmpty():
+            return
+
+        scaled = source.scaled(
+            rect.size(),
+            Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+
+        x = max(0, (scaled.width() - rect.width()) // 2)
+        y = max(0, (scaled.height() - rect.height()) // 2)
+        source_rect = scaled.rect().adjusted(
+            x, y,
+            -(scaled.width() - rect.width() - x),
+            -(scaled.height() - rect.height() - y),
+        )
+
+        if isinstance(source, QImage):
+            painter.drawImage(rect, scaled, source_rect)
+        else:
+            painter.drawPixmap(rect, scaled, source_rect)
+
+        painter.fillRect(rect, QColor(8, 10, 24, 95))
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(
+            QPainter.RenderHint.SmoothPixmapTransform
+        )
+
+        rect = self.rect()
+
+        if not self.transparent_base or not self.video_frame.isNull():
+            self.paint_wallpaper(painter, rect)
+        else:
+            painter.fillRect(rect, QColor("#11131e"))
+
+        if not self.effects_enabled:
+            return
+
+        for particle in self.particles:
+            x = particle["x"] * self.width()
+            y = particle["y"] * self.height()
+            pulse = (math.sin(particle["phase"]) + 1) / 2
+            radius = particle["radius"]
+            alpha = int(70 + 165 * pulse)
+
+            gradient = QRadialGradient(x, y, radius * 5)
+            gradient.setColorAt(0, QColor(151, 125, 255, alpha))
+            gradient.setColorAt(
+                0.4, QColor(74, 205, 255, alpha // 2)
+            )
+            gradient.setColorAt(1, QColor(74, 205, 255, 0))
+
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(gradient))
+            painter.drawEllipse(
+                int(x - radius * 5), int(y - radius * 5),
+                int(radius * 10), int(radius * 10)
+            )
+
+            painter.setBrush(QColor(235, 240, 255, alpha))
+            painter.drawEllipse(
+                int(x - radius), int(y - radius),
+                int(radius * 2), int(radius * 2)
+            )
+
+
+class BackgroundContainer(QWidget):
+    def __init__(self, content, image_path="", effects=True, parent=None):
+        super().__init__(parent)
+
+        self.content = content
+        self.player = None
+        self.audio_output = None
+        self.video_sink = None
+
+        self.setObjectName("backgroundContainer")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
+
+        is_video = bool(image_path and image_path.lower().endswith(".mp4"))
+
+        self.background = AnimatedBackground(self)
+        self.background.setAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents, True
+        )
+
+        if is_video and MULTIMEDIA_AVAILABLE:
+            self.background.transparent_base = True
+            self.player = QMediaPlayer(self)
+            self.audio_output = QAudioOutput(self)
+            self.audio_output.setVolume(0.0)
+            self.video_sink = QVideoSink(self)
+            self.video_sink.videoFrameChanged.connect(
+                self._on_video_frame_changed
+            )
+            self.player.setAudioOutput(self.audio_output)
+            self.player.setVideoSink(self.video_sink)
+            self.player.setSource(QUrl.fromLocalFile(image_path))
+            self.player.setLoops(QMediaPlayer.Loops.Infinite)
+        elif is_video:
+            self.background.transparent_base = False
+        elif image_path:
+            self.background.set_image(image_path)
+
+        self.background.set_effects(effects)
+        self.content.setParent(self)
+        self.content.setAttribute(
+            Qt.WidgetAttribute.WA_TranslucentBackground, True
+        )
+        self.content.setAttribute(
+            Qt.WidgetAttribute.WA_StyledBackground, False
+        )
+
+        self._position_layers()
+
+        if self.player:
+            self.player.play()
+
+    def _on_video_frame_changed(self, frame):
+        if frame.isValid():
+            image = frame.toImage()
+            if not image.isNull():
+                self.background.set_video_frame(image)
+
+    def _position_layers(self):
+        rect = self.rect()
+        self.background.setGeometry(rect)
+        self.background.lower()
+        self.content.setGeometry(rect)
+        self.content.raise_()
+
+    def resizeEvent(self, event):
+        self._position_layers()
+        super().resizeEvent(event)
+
+    def stop(self):
+        if self.player:
+            self.player.stop()
+            self.player.setVideoSink(None)
+            self.player.setAudioOutput(None)
+            self.player.deleteLater()
+            self.player = None
+
+        if self.video_sink:
+            try:
+                self.video_sink.videoFrameChanged.disconnect(
+                    self._on_video_frame_changed
+                )
+            except (RuntimeError, TypeError):
+                pass
+            self.video_sink.deleteLater()
+            self.video_sink = None
+
+        self.audio_output = None
+
+
+# ---------------------------------------------------------
+# Main application
+# ---------------------------------------------------------
+
+class GamePack(QMainWindow):
+    def __init__(self):
+        super().__init__()
+
+        self.settings = load_settings()
+        self.password = None
+        self.games = {}
+        self.imported_games = load_imported_games()
+        self.workers = []
+        self.fade_animations = []
+
+        self.theme = self.settings.get("theme", "Dark")
+        self.custom_bg = self.settings.get("custom_bg", "#171923")
+        self.custom_fg = self.settings.get("custom_fg", "#f4f5ff")
+        self.background = self.settings.get("background", "")
+        self.effects = self.settings.get("effects", True)
+        self.transitions = self.settings.get("transitions", True)
+        self.duration_ms = self.settings.get("duration_ms", 280)
+
+        self.background_container = None
+        self.background_layer = None
+        self.central_content = None
+
+        self.setWindowTitle("GamePack")
+        if Path(ICON_PATH).is_file():
+            self.setWindowIcon(QIcon(ICON_PATH))
+        self.resize(1180, 780)
+        self.setMinimumSize(900, 620)
+
+        self.build_gate()
+
+    def clear_window(self):
+        old = self.takeCentralWidget()
+        self.central_content = None
+        self.background_layer = None
+        self.background_container = None
+
+        if old:
+            if isinstance(old, BackgroundContainer):
+                old.stop()
+            old.deleteLater()
+
+    def make_background_layers(self, content):
+        self.central_content = content
+        container = BackgroundContainer(
+            content, self.background, self.effects
+        )
+        self.background_container = container
+        self.background_layer = container.background
+        return container
+
+    # Password gate
+
+    def build_gate(self):
+        self.clear_window()
+
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(100, 55, 100, 55)
+        layout.addStretch()
+
+        logo = QLabel("GAMEPACK")
+        logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        logo.setStyleSheet(
+            "font-size: 36pt; font-weight: 900; letter-spacing: 6px;"
+        )
+        layout.addWidget(logo)
+
+        subtitle = QLabel("YOUR PRIVATE GAME LIBRARY")
+        subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(subtitle)
+        layout.addSpacing(25)
+
+        self.password_input = QLineEdit()
+        self.password_input.setEchoMode(QLineEdit.EchoMode.Password)
+        self.password_input.setPlaceholderText("Enter master password")
+        self.password_input.returnPressed.connect(self.unlock)
+        layout.addWidget(self.password_input)
+
+        button = QPushButton("✦   Unlock GamePack")
+        button.clicked.connect(self.unlock)
+        layout.addWidget(button)
+
+        if not load_master_password():
+            note_text = (
+                "Password configuration is missing or empty. "
+                "Generate a password using GamePack Admin."
+            )
+        else:
+            note_text = (
+                "Enter the current password configured by GamePack Admin. "
+                "Your archive encryption remains unchanged."
+            )
+
+        note = QLabel(note_text)
+        note.setWordWrap(True)
+        note.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(note)
+        layout.addStretch()
+
+        self.setCentralWidget(self.make_background_layers(page))
+        self.apply_theme()
+        self.password_input.setFocus()
+
+    def unlock(self):
+        candidate = self.password_input.text()
+
+  
+
+    def unlock(self):
+        candidate = self.password_input.text()
+        current_password = load_master_password()
+
+        if not current_password:
+            QMessageBox.warning(
+                self,
+                "Password not configured",
+                "Could not read the password configuration file:\n"
+                f"{PASSWORD_CONFIG}",
+            )
+            return
+
+        if not hmac.compare_digest(candidate, current_password):
+            QMessageBox.warning(
+                self,
+                "Incorrect password",
+                "The password is incorrect.",
+            )
+            self.password_input.clear()
+            return
+
+        self.password = candidate
+        self.build_main()
+
+
+    # Main layout and pages
+
+    def build_main(self):
+        self.clear_window()
+
+        root = QWidget()
+        root_layout = QHBoxLayout(root)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+
+        self.sidebar = QFrame()
+        self.sidebar.setObjectName("sidebar")
+        self.sidebar.setFixedWidth(210)
+
+        side = QVBoxLayout(self.sidebar)
+        side.setContentsMargins(14, 24, 14, 20)
+
+        logo = QLabel("GAMEPACK")
+        logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        logo.setStyleSheet(
+            "font-size: 21pt; font-weight: 900; letter-spacing: 2px;"
+        )
+        side.addWidget(logo)
+        side.addSpacing(20)
+
+        self.pages = QStackedWidget()
+        self.pages.setObjectName("pages")
+        self.nav_buttons = []
+
+        names = [
+            "⌂   Library",
+            "＋   Import Games",
+            "▣   Packages",
+            "⇩   Downloads",
+            "✧   Theme Studio",
+            "⚙   Settings",
+        ]
+
+        for index, name in enumerate(names):
+            button = QPushButton(name)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.clicked.connect(
+                lambda checked=False, i=index: self.switch_page(i)
+            )
+            side.addWidget(button)
+            self.nav_buttons.append(button)
+
+        side.addStretch()
+
+        lock_button = QPushButton("🔒   Lock GamePack")
+        lock_button.clicked.connect(self.lock_app)
+        side.addWidget(lock_button)
+
+        root_layout.addWidget(self.sidebar)
+        root_layout.addWidget(self.pages, 1)
+
+        self.build_library_page()
+        self.build_import_page()
+        self.build_packages_page()
+        self.build_downloads_page()
+        self.build_theme_page()
+        self.build_settings_page()
+
+        self.setCentralWidget(self.make_background_layers(root))
+        self.apply_theme()
+        self.switch_page(0, animate=False)
+        self.scan_local()
+
+    def make_page(self, title, subtitle):
+        page = QWidget()
+        page.setObjectName("page")
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(28, 25, 28, 25)
+        layout.setSpacing(13)
+
+        heading = QLabel(title)
+        heading.setObjectName("heading")
+        layout.addWidget(heading)
+
+        desc = QLabel(subtitle)
+        desc.setWordWrap(True)
+        desc.setObjectName("muted")
+        layout.addWidget(desc)
+
+        self.pages.addWidget(page)
+        return page, layout
+
+    def build_library_page(self):
+        _, layout = self.make_page(
+            "Your Library",
+            "Browse local Steam installations and load your account library."
+        )
+
+        controls = QHBoxLayout()
+
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Search your library...")
+        self.search.textChanged.connect(self.populate_games)
+        controls.addWidget(self.search, 1)
+
+        self.library_source = QComboBox()
+        self.library_source.addItems([
+            "Steam Library",
+            "Imported Catalog",
+            "LuaTools Library",
+        ])
+        controls.addWidget(self.library_source)
+
+        scan = QPushButton("↻  Scan Library")
+        scan.clicked.connect(self.scan_selected_library)
+        controls.addWidget(scan)
+        layout.addLayout(controls)
+
+        self.game_tree = QTreeWidget()
+        self.game_tree.setHeaderLabels(["Game", "Status", "App ID"])
+        self.game_tree.setColumnWidth(0, 350)
+        self.game_tree.itemSelectionChanged.connect(self.game_selected)
+        layout.addWidget(self.game_tree, 2)
+
+        preview_row = QHBoxLayout()
+
+        self.thumbnail = QLabel("Select a game")
+        self.thumbnail.setFixedSize(340, 160)
+        self.thumbnail.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.thumbnail.setObjectName("thumbnail")
+        preview_row.addWidget(self.thumbnail)
+
+        details = QVBoxLayout()
+
+        self.preview_title = QLabel("No game selected")
+        self.preview_title.setObjectName("heading")
+        self.preview_title.setWordWrap(True)
+        details.addWidget(self.preview_title)
+
+        self.preview_status = QLabel("Choose a title above.")
+        self.preview_status.setWordWrap(True)
+        details.addWidget(self.preview_status)
+
+        self.package_button = QPushButton("✦  Create encrypted package")
+        self.package_button.clicked.connect(self.package_selected)
+        self.package_button.setEnabled(False)
+        details.addWidget(self.package_button)
+
+        custom_art = QPushButton("Choose custom thumbnail…")
+        custom_art.clicked.connect(self.choose_custom_thumbnail)
+        details.addWidget(custom_art)
+
+        details.addStretch()
+        preview_row.addLayout(details, 1)
+        layout.addLayout(preview_row)
+
+        self.library_status = QLabel("Scanning Steam libraries…")
+        layout.addWidget(self.library_status)
+
+    # Import Games page
+
+    def build_import_page(self):
+        _, layout = self.make_page(
+            "Import Games",
+            "Search by title or AppID, add catalog entries, and inspect metadata."
+        )
+
+        search_row = QHBoxLayout()
+
+        self.import_search = QLineEdit()
+        self.import_search.setPlaceholderText(
+            "Game title, AppID, Steam Store URL, or SteamDB URL..."
+        )
+        self.import_search.returnPressed.connect(self.search_import_games)
+        search_row.addWidget(self.import_search, 1)
+
+        search_button = QPushButton("Search")
+        search_button.clicked.connect(self.search_import_games)
+        search_row.addWidget(search_button)
+        layout.addLayout(search_row)
+
+        source_row = QHBoxLayout()
+        source_row.addWidget(QLabel("Search source"))
+
+        self.import_source = QComboBox()
+        self.import_source.addItems([
+            "Steam Store",
+            "SteamDB / AppID",
+            "Local catalog",
+        ])
+        source_row.addWidget(self.import_source, 1)
+        layout.addLayout(source_row)
+
+        self.import_results = QTreeWidget()
+        self.import_results.setHeaderLabels(["Game", "AppID", "Source"])
+        self.import_results.setColumnWidth(0, 330)
+        self.import_results.itemDoubleClicked.connect(
+            self.import_result_selected
+        )
+        layout.addWidget(self.import_results, 1)
+
+        buttons = QHBoxLayout()
+
+        add_button = QPushButton("Add selected to Library")
+        add_button.clicked.connect(self.add_selected_import)
+        buttons.addWidget(add_button)
+
+        manual_button = QPushButton("Add game manually…")
+        manual_button.clicked.connect(self.add_manual_game)
+        buttons.addWidget(manual_button)
+        layout.addLayout(buttons)
+
+        file_row = QHBoxLayout()
+
+        lua_button = QPushButton("Inspect Lua file…")
+        lua_button.clicked.connect(self.import_lua_file)
+        file_row.addWidget(lua_button)
+
+        manifest_button = QPushButton("Import Steam manifest…")
+        manifest_button.clicked.connect(self.import_manifest_file)
+        file_row.addWidget(manifest_button)
+
+        zip_button = QPushButton("Inspect ZIP archive…")
+        zip_button.clicked.connect(self.import_zip_file)
+        file_row.addWidget(zip_button)
+        layout.addLayout(file_row)
+
+        link_row = QHBoxLayout()
+        self.import_link = QLineEdit()
+        self.import_link.setPlaceholderText(
+            "Paste a Steam Store or SteamDB link"
+        )
+        link_row.addWidget(self.import_link, 1)
+
+        link_button = QPushButton("Import link")
+        link_button.clicked.connect(self.import_link_entry)
+        link_row.addWidget(link_button)
+        layout.addLayout(link_row)
+
+        self.import_status = QLabel(
+            "Catalog entries do not install game files or grant licenses."
+        )
+        self.import_status.setWordWrap(True)
+        layout.addWidget(self.import_status)
+
+        self.refresh_import_results()
+
+    def refresh_import_results(self):
+        if not hasattr(self, "import_results"):
+            return
+
+        self.import_results.clear()
+
+        for game in self.imported_games:
+            item = QTreeWidgetItem([
+                str(game.get("name", "Unknown game")),
+                str(game.get("appid", "")),
+                str(game.get("source", "Manual")),
+            ])
+            item.setData(0, Qt.ItemDataRole.UserRole, game)
+            self.import_results.addTopLevelItem(item)
+
+    def add_import_record(self, name, appid="", source="Manual", folder=""):
+        name = safe_game_name(name)
+
+        if not name:
+            QMessageBox.warning(
+                self, "Game name required", "Enter a valid game name."
+            )
+            return
+
+        appid = str(appid).strip()
+        if appid and not appid.isdigit():
+            appid = ""
+
+        resolved_folder = valid_local_folder(folder)
+
+        for existing in self.imported_games:
+            old_appid = str(existing.get("appid", ""))
+            old_name = safe_game_name(existing.get("name", ""))
+
+            same_appid = bool(appid and old_appid == appid)
+            same_name = old_name.casefold() == name.casefold()
+
+            if same_appid or same_name:
+                if resolved_folder:
+                    existing["folder"] = str(resolved_folder)
+                    existing["available"] = True
+                    existing["catalog_only"] = False
+
+                if appid and not old_appid:
+                    existing["appid"] = appid
+
+                try:
+                    save_imported_games(self.imported_games)
+                except OSError as exc:
+                    QMessageBox.warning(self, "Save failed", str(exc))
+                    return
+
+                self.merge_imported_into_library()
+                self.refresh_import_results()
+                self.import_status.setText(
+                    f"{name} already existed; its catalog entry was updated."
+                )
+                return
+
+        record = {
+            "name": name,
+            "appid": appid,
+            "source": source,
+            "folder": str(resolved_folder) if resolved_folder else "",
+            "available": bool(resolved_folder),
+            "owned": False,
+            "catalog_only": not bool(resolved_folder),
+            "added": datetime.now().isoformat(timespec="seconds"),
+        }
+
+        self.imported_games.append(record)
+
+        try:
+            save_imported_games(self.imported_games)
+        except OSError as exc:
+            self.imported_games.pop()
+            QMessageBox.warning(self, "Save failed", str(exc))
+            return
+
+        self.merge_imported_into_library()
+        self.refresh_import_results()
+        self.import_status.setText(f"Added {name} to your catalog.")
+
+    def merge_imported_into_library(self):
+        for record in self.imported_games:
+            appid = str(record.get("appid", "")).strip()
+
+            # Entries without a Steam AppID stay in the import catalog.
+            if not appid or not appid.isdigit():
+                continue
+
+            game = self.games.get(appid, {})
+            game.update({
+                "appid": appid,
+                "name": record.get("name", f"Steam app {appid}"),
+                "source": record.get("source", "Imported"),
+                "catalog_only": record.get("catalog_only", True),
+                "owned": game.get("owned", record.get("owned", False)),
+            })
+
+            folder = valid_local_folder(record.get("folder", ""))
+
+            if folder:
+                game["folder"] = folder
+                game["available"] = True
+                game["catalog_only"] = False
+            else:
+                game.setdefault("folder", None)
+                game.setdefault("available", False)
+
+            self.games[appid] = game
+
+        if hasattr(self, "game_tree"):
+            self.populate_games()
+
+    def search_import_games(self):
+        query = self.import_search.text().strip()
+
+        if not query:
+            self.import_status.setText("Type a game title or AppID first.")
+            return
+
+        appid = extract_steam_appid(query)
+
+        if appid:
+            existing = next(
+                (
+                    game for game in self.imported_games
+                    if str(game.get("appid", "")) == appid
+                ),
+                None,
+            )
+
+            if existing:
+                self.import_status.setText(
+                    f"AppID {appid} is already in your catalog."
+                )
+                self.refresh_import_results()
+                return
+
+            name, ok = QInputDialog.getText(
+                self, "Game title",
+                f"AppID {appid} recognized. Enter the game title:"
+            )
+
+            if ok and name.strip():
+                self.add_import_record(
+                    name, appid, "Steam Store / SteamDB"
+                )
+            return
+
+        source = self.import_source.currentText()
+
+        if source == "Local catalog":
+            self.import_results.clear()
+            matches = [
+                game for game in self.imported_games
+                if query.casefold() in game.get("name", "").casefold()
+            ]
+
+            for game in matches:
+                item = QTreeWidgetItem([
+                    game.get("name", ""),
+                    str(game.get("appid", "")),
+                    game.get("source", "Manual"),
+                ])
+                item.setData(0, Qt.ItemDataRole.UserRole, game)
+                self.import_results.addTopLevelItem(item)
+
+            self.import_status.setText(
+                f"Found {len(matches)} matching catalog entries."
+            )
+            return
+
+        if source == "SteamDB / AppID":
+            self.import_status.setText(
+                "SteamDB title search is opened in your browser. Find the "
+                "game, then paste its AppID or URL above."
+            )
+            webbrowser.open(
+                "https://steamdb.info/search/?a=app&q="
+                + urllib.parse.quote(query)
+            )
+            return
+
+        url = (
+            "https://store.steampowered.com/api/storesearch/?"
+            + urllib.parse.urlencode({
+                "term": query,
+                "l": "english",
+                "cc": "us",
+            })
+        )
+
+        self.import_status.setText("Searching the Steam Store…")
+        worker = Worker(url)
+        worker.result.connect(self.import_search_received)
+        worker.failed.connect(
+            lambda err: self.import_status.setText(
+                "Steam Store search failed: " + err
+            )
+        )
+        self.start_worker(worker)
+
+    def import_search_received(self, data):
+        try:
+            response = json.loads(data.decode("utf-8"))
+            results = response.get("items", response.get("results", []))
+            self.import_results.clear()
+
+            for result in results:
+                appid = str(result.get("id", result.get("appid", "")))
+                name = safe_game_name(result.get("name", ""))
+
+                if not appid.isdigit() or not name:
+                    continue
+
+                item = QTreeWidgetItem([name, appid, "Steam Store"])
+                item.setData(0, Qt.ItemDataRole.UserRole, {
+                    "name": name,
+                    "appid": appid,
+                    "source": "Steam Store",
+                })
+                self.import_results.addTopLevelItem(item)
+
+            self.import_status.setText(
+                f"Found {self.import_results.topLevelItemCount()} results. "
+                "Select a result and add it to your catalog."
+            )
+        except Exception as exc:
+            self.import_status.setText(
+                "Could not read Steam Store results: " + str(exc)
+            )
+
+    def import_result_selected(self, item, column=0):
+        record = item.data(0, Qt.ItemDataRole.UserRole) or {}
+        self.import_status.setText(
+            f"Selected: {record.get('name', item.text(0))}"
+        )
+
+    def add_selected_import(self):
+        items = self.import_results.selectedItems()
+
+        if not items:
+            QMessageBox.information(
+                self, "Select a game", "Select a search result first."
+            )
+            return
+
+        record = items[0].data(0, Qt.ItemDataRole.UserRole) or {}
+
+        self.add_import_record(
+            record.get("name", items[0].text(0)),
+            record.get("appid", items[0].text(1)),
+            record.get("source", items[0].text(2)),
+        )
+
+    def add_manual_game(self):
+        name, ok = QInputDialog.getText(
+            self, "Add game", "Game title:"
+        )
+        if not ok or not name.strip():
+            return
+
+        appid, ok = QInputDialog.getText(
+            self, "Steam AppID (optional)",
+            "Steam AppID, or leave blank for another game:"
+        )
+        if not ok:
+            return
+
+        folder = QFileDialog.getExistingDirectory(
+            self, "Optional local game folder"
+        )
+
+        self.add_import_record(
+            name, appid, "Manual", folder or ""
+        )
+
+    def import_link_entry(self):
+        url = self.import_link.text().strip()
+        appid = extract_steam_appid(url)
+
+        if not appid:
+            QMessageBox.warning(
+                self, "Unsupported link",
+                "Paste a Steam Store URL, SteamDB URL, or numeric AppID."
+            )
+            return
+
+        if "steamdb.info" in url.casefold():
+            source = "SteamDB"
+        else:
+            source = "Steam Store"
+
+        existing = next(
+            (
+                game for game in self.imported_games
+                if str(game.get("appid", "")) == appid
+            ),
+            None,
+        )
+
+        if existing:
+            self.import_status.setText(
+                f"{existing.get('name')} (AppID {appid}) is already listed."
+            )
+            return
+
+        name, ok = QInputDialog.getText(
+            self, "Game title",
+            f"AppID {appid} recognized. Enter the game's title:"
+        )
+
+        if ok and name.strip():
+            self.add_import_record(name, appid, source)
+
+    def import_manifest_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select Steam manifest", str(Path.home()),
+            "Steam manifests (*.acf);;All files (*)"
+        )
+        if not path:
+            return
+
+        game = parse_manifest(Path(path))
+
+        if not game:
+            QMessageBox.warning(
+                self, "Manifest not recognized",
+                "No recognizable Steam AppID and title were found."
+            )
+            return
+
+        folder = str(game["folder"]) if game["folder"].is_dir() else ""
+        self.add_import_record(
+            game["name"], game["appid"], "Steam manifest", folder
+        )
+
+    def import_lua_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Inspect Lua metadata", str(Path.home()),
+            "Lua files (*.lua);;Text files (*.txt);;All files (*)"
+        )
+        if not path:
+            return
+
+        try:
+            # Read text only. Imported Lua is never executed.
+            with open(path, "rb") as file:
+                raw = file.read(2_000_000)
+            text = raw.decode("utf-8", errors="ignore")
+        except OSError as exc:
+            QMessageBox.warning(self, "Could not read file", str(exc))
+            return
+
+        appid_match = re.search(
+            r"""(?:appid|app_id|steam_appid)\s*[=:]\s*["']?(\d+)""",
+            text, re.IGNORECASE
+        )
+        name_match = re.search(
+            r"""(?:game_name|gamename|name|title)\s*[=:]\s*["']([^"']{1,160})""",
+            text, re.IGNORECASE
+        )
+
+        appid = appid_match.group(1) if appid_match else ""
+        name = (
+            name_match.group(1).strip()
+            if name_match else Path(path).stem
+        )
+
+        self.add_import_record(name, appid, "Lua metadata")
+        self.import_status.setText(
+            "Lua file read as text only. If its format uses different "
+            "field names, add the title manually."
+        )
+
+    def import_zip_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Inspect ZIP archive", str(Path.home()),
+            "ZIP archives (*.zip);;All files (*)"
+        )
+        if not path:
+            return
+
+        try:
+            with zipfile.ZipFile(path, "r") as archive:
+                manifests = [
+                    name for name in archive.namelist()
+                    if Path(name).name.startswith("appmanifest_")
+                    and name.endswith(".acf")
+                ]
+
+                imported = 0
+
+                for member_name in manifests[:20]:
+                    info = archive.getinfo(member_name)
+
+                    if info.file_size > 1_000_000:
+                        continue
+
+                    text = archive.read(member_name).decode(
+                        "utf-8", errors="ignore"
+                    )
+
+                    appid_match = re.search(
+                        r'"appid"\s*"(\d+)"', text
+                    )
+                    name_match = re.search(
+                        r'"name"\s*"([^"]+)"', text
+                    )
+
+                    if appid_match and name_match:
+                        self.add_import_record(
+                            name_match.group(1),
+                            appid_match.group(1),
+                            "ZIP manifest",
+                        )
+                        imported += 1
+
+                if not manifests:
+                    self.add_import_record(
+                        Path(path).stem, "", "ZIP filename"
+                    )
+                    self.import_status.setText(
+                        "No Steam manifest found. Added the ZIP filename "
+                        "to the catalog. Nothing was extracted."
+                    )
+                else:
+                    self.import_status.setText(
+                        f"Inspected archive metadata. Added or updated "
+                        f"{imported} catalog entries. Nothing was extracted."
+                    )
+
+        except (OSError, zipfile.BadZipFile, RuntimeError) as exc:
+            QMessageBox.warning(
+                self, "ZIP inspection failed", str(exc)
+            )
+
+    # Packages and downloads
+
+    def build_packages_page(self):
+        _, layout = self.make_page(
+            "Packages",
+            "Open and extract encrypted GamePack archives."
+        )
+        info = QLabel(
+            "Choose a .gpk file and extract its contents into a folder."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        button = QPushButton("Open and extract package…")
+        button.clicked.connect(self.open_package)
+        layout.addWidget(button)
+        layout.addStretch()
+
+    def build_downloads_page(self):
+        _, layout = self.make_page(
+            "Downloads",
+            "Manage packages you receive from trusted sources."
+        )
+        label = QLabel(
+            "A download server is not included. Only open packages "
+            "from sources you trust."
+        )
+        label.setWordWrap(True)
+        layout.addWidget(label)
+        layout.addStretch()
+
+    # Theme Studio
+
+    def build_theme_page(self):
+        _, layout = self.make_page(
+            "Theme Studio",
+            "Make GamePack yours with wallpapers, glow, and animation."
+        )
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Color theme"))
+
+        self.theme_combo = QComboBox()
+        self.theme_combo.addItems(["Dark", "Light", "Custom"])
+        if self.theme not in ("Dark", "Light", "Custom"):
+            self.theme = "Dark"
+        self.theme_combo.setCurrentText(self.theme)
+        self.theme_combo.currentTextChanged.connect(self.change_theme)
+        row.addWidget(self.theme_combo)
+        layout.addLayout(row)
+
+        background_button = QPushButton(
+            "▧  Choose image or MP4 wallpaper…"
+        )
+        background_button.clicked.connect(self.choose_background)
+        layout.addWidget(background_button)
+
+        clear_background = QPushButton("Clear wallpaper")
+        clear_background.clicked.connect(self.clear_background)
+        layout.addWidget(clear_background)
+
+        color_button = QPushButton("Choose custom background color…")
+        color_button.clicked.connect(self.choose_custom_color)
+        layout.addWidget(color_button)
+
+        self.effects_box = QCheckBox(
+            "Enable sparkles, hover glow, and visual effects"
+        )
+        self.effects_box.setChecked(self.effects)
+        self.effects_box.toggled.connect(self.toggle_effects)
+        layout.addWidget(self.effects_box)
+
+        self.transitions_box = QCheckBox("Enable page transitions")
+        self.transitions_box.setChecked(self.transitions)
+        self.transitions_box.toggled.connect(self.toggle_transitions)
+        layout.addWidget(self.transitions_box)
+
+        layout.addWidget(QLabel("Transition duration"))
+        self.duration_slider = QSlider(Qt.Orientation.Horizontal)
+        self.duration_slider.setRange(100, 900)
+        self.duration_slider.setValue(int(self.duration_ms))
+        self.duration_slider.valueChanged.connect(self.save_preferences)
+        layout.addWidget(self.duration_slider)
+
+        save = QPushButton("Save preferences")
+        save.clicked.connect(self.save_preferences)
+        layout.addWidget(save)
+        layout.addStretch()
+
+    def build_settings_page(self):
+        _, layout = self.make_page(
+            "Settings",
+            "Steam account lookup and local app settings."
+        )
+        label = QLabel(
+            "Account lookup uses the Steam Web API key and SteamID64 "
+            "you provide. GamePack never asks for your Steam password. "
+            "Account results depend on Steam privacy settings and API access."
+        )
+        label.setWordWrap(True)
+        layout.addWidget(label)
+        layout.addStretch()
+
+    # Navigation and transitions
+
+    def switch_page(self, index, animate=True):
+        target = self.pages.widget(index)
+
+        for i, button in enumerate(self.nav_buttons):
+            button.setProperty("active", i == index)
+            button.style().unpolish(button)
+            button.style().polish(button)
+
+        if target is None or target is self.pages.currentWidget():
+            return
+
+        if target.graphicsEffect() is not None:
+            target.setGraphicsEffect(None)
+
+        self.pages.setCurrentWidget(target)
+
+        if animate and self.transitions:
+            effect = QGraphicsOpacityEffect(target)
+            target.setGraphicsEffect(effect)
+            effect.setOpacity(0.0)
+
+            animation = QPropertyAnimation(effect, b"opacity", self)
+            animation.setDuration(int(self.duration_ms))
+            animation.setStartValue(0.0)
+            animation.setEndValue(1.0)
+            animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+            self.fade_animations.append(animation)
+            animation.finished.connect(
+                lambda a=animation, w=target: self.finish_fade(a, w)
+            )
+            animation.start()
+
+    def finish_fade(self, animation, page):
+        page.setGraphicsEffect(None)
+
+        if animation in self.fade_animations:
+            self.fade_animations.remove(animation)
+
+        animation.deleteLater()
+
+    # Worker management
+
+    def start_worker(self, worker):
+        self.workers.append(worker)
+        worker.finished.connect(
+            lambda w=worker:
+                self.workers.remove(w) if w in self.workers else None
+        )
+        worker.start()
+
+    # Library and artwork
+
+    def scan_selected_library(self):
+        source = self.library_source.currentText()
+
+        if source == "LuaTools Library":
+            QMessageBox.information(
+                self, "LuaTools library",
+                "A verified LuaTools library export/API format has not "
+                "been configured. Use Import Games to inspect metadata "
+                "or add games manually."
+            )
+            return
+
+        if source == "Imported Catalog":
+            self.games = {}
+            self.merge_imported_into_library()
+            self.populate_games()
+            self.library_status.setText(
+                f"{len(self.imported_games)} imported catalog entries."
+            )
+            return
+
+        self.scan_local()
+        self.fetch_owned_games()
+
+    def scan_local(self):
+        local = scan_local_games()
+
+        for appid, game in local.items():
+            old = self.games.get(appid, {})
+            old.update(game)
+            self.games[appid] = old
+
+        self.merge_imported_into_library()
+        self.populate_games()
+
+        installed = sum(
+            bool(game.get("available"))
+            for game in self.games.values()
+        )
+
+        if hasattr(self, "library_status"):
+            self.library_status.setText(
+                f"{len(self.games)} titles listed · "
+                f"{installed} local folders found."
+            )
+
+    def populate_games(self, *_):
+        if not hasattr(self, "game_tree"):
+            return
+
+        self.game_tree.clear()
+        query = self.search.text().casefold()
+
+        for appid, game in sorted(
+            self.games.items(),
+            key=lambda pair: pair[1].get("name", "").casefold(),
+        ):
+            name = str(game.get("name", f"Steam app {appid}"))
+
+            if query and query not in name.casefold():
+                continue
+
+            if game.get("available"):
+                status = "Installed"
+            elif game.get("owned"):
+                status = "Not installed"
+            elif game.get("catalog_only"):
+                status = "Catalog entry"
+            else:
+                status = "Files missing"
+
+            item = QTreeWidgetItem([name, status, str(appid)])
+            item.setData(0, Qt.ItemDataRole.UserRole, str(appid))
+            self.game_tree.addTopLevelItem(item)
+
+    def selected_game(self):
+        if not hasattr(self, "game_tree"):
+            return None
+
+        items = self.game_tree.selectedItems()
+        if not items:
+            return None
+
+        appid = items[0].data(0, Qt.ItemDataRole.UserRole)
+        return self.games.get(appid)
+
+    def game_selected(self):
+        game = self.selected_game()
+
+        if not game:
+            self.thumbnail.setPixmap(QPixmap())
+            self.thumbnail.setText("Select a game")
+            self.preview_title.setText("No game selected")
+            self.preview_status.setText("Choose a title above.")
+            self.package_button.setEnabled(False)
+            return
+
+        self.preview_title.setText(game.get("name", "Unknown game"))
+
+        if game.get("available"):
+            status = "Installed"
+        elif game.get("owned"):
+            status = "Not installed"
+        elif game.get("catalog_only"):
+            status = "Catalog entry — local files not linked"
+        else:
+            status = "Local files unavailable"
+
+        appid = game.get("appid") or "N/A"
+        self.preview_status.setText(f"Steam App ID: {appid} · {status}")
+
+        self.package_button.setEnabled(
+            bool(game.get("available") and game.get("folder"))
+        )
+        self.load_thumbnail(game)
+
+    def load_thumbnail(self, game):
+        appid = str(game.get("appid", ""))
+        if not appid.isdigit():
+            self.thumbnail.setPixmap(QPixmap())
+            self.thumbnail.setText("No Steam artwork ID")
+            return
+
+        ART_DIR.mkdir(parents=True, exist_ok=True)
+
+        cached = ART_DIR / f"{appid}.jpg"
+        custom = game.get("custom_thumbnail")
+        path = Path(custom) if custom else cached
+
+        if path.is_file():
+            pixmap = QPixmap(str(path))
+            if not pixmap.isNull():
+                self.thumbnail.setPixmap(
+                    pixmap.scaled(
+                        self.thumbnail.size(),
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
+                )
+                return
+
+        self.thumbnail.setPixmap(QPixmap())
+        self.thumbnail.setText("Loading artwork…")
+
+        url = (
+            "https://cdn.akamai.steamstatic.com/"
+            f"steam/apps/{appid}/header.jpg"
+        )
+
+        worker = Worker(url)
+        worker.result.connect(
+            lambda data, g=game: self.artwork_received(g, data)
+        )
+        worker.failed.connect(
+            lambda _err, g=game: self.artwork_failed(g)
+        )
+        self.start_worker(worker)
+
+    def artwork_failed(self, game):
+        selected = self.selected_game()
+        if selected and selected.get("appid") == game.get("appid"):
+            self.thumbnail.setPixmap(QPixmap())
+            self.thumbnail.setText("Artwork unavailable")
+
+    def artwork_received(self, game, data):
+        pixmap = QPixmap()
+        if not pixmap.loadFromData(data):
+            self.artwork_failed(game)
+            return
+
+        ART_DIR.mkdir(parents=True, exist_ok=True)
+
+        try:
+            (ART_DIR / f"{game['appid']}.jpg").write_bytes(data)
+        except OSError:
+            pass
+
+        selected = self.selected_game()
+        if selected and selected.get("appid") == game.get("appid"):
+            self.thumbnail.setPixmap(
+                pixmap.scaled(
+                    self.thumbnail.size(),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            )
+
+    def choose_custom_thumbnail(self):
+        game = self.selected_game()
+
+        if not game:
+            QMessageBox.information(
+                self, "Select a game", "Select a game first."
+            )
+            return
+
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Choose thumbnail", str(Path.home()),
+            "Images (*.png *.jpg *.jpeg *.webp *.bmp)"
+        )
+
+        if path:
+            game["custom_thumbnail"] = path
+            self.game_selected()
+
+    def fetch_owned_games(self):
+        api_key = API_KEY.strip()
+        steamid = str(USERID).strip()
+
+        if not api_key:
+            QMessageBox.information(
+                self, "Steam API",
+                "Add your Steam Web API key to steam_config.py to "
+                "load account-owned games."
+            )
+            return
+
+        if not re.fullmatch(r"\d{17}", steamid):
+            QMessageBox.warning(
+                self, "SteamID64",
+                "Check the SteamID64 in steam_config.py."
+            )
+            return
+
+        params = urllib.parse.urlencode({
+            "key": api_key,
+            "steamid": steamid,
+            "include_appinfo": "1",
+            "include_played_free_games": "1",
+        })
+
+        url = (
+            "https://api.steampowered.com/"
+            "IPlayerService/GetOwnedGames/v1/?"
+            + params
+        )
+
+        self.library_status.setText("Loading Steam account library…")
+
+        worker = Worker(url)
+        worker.result.connect(self.owned_games_received)
+        worker.failed.connect(
+            lambda err: QMessageBox.warning(
+                self, "Steam API",
+                "Could not load account library:\n" + err
+            )
+        )
+        self.start_worker(worker)
+
+    def owned_games_received(self, data):
+        try:
+            response = json.loads(data.decode("utf-8"))
+            owned = response.get("response", {}).get("games")
+
+            if owned is None:
+                raise ValueError(
+                    "Steam returned no owned-games list. Check the API "
+                    "key, SteamID64, account privacy, and API access."
+                )
+
+            for item in owned:
+                appid = str(item.get("appid", ""))
+                if not appid.isdigit():
+                    continue
+
+                game = self.games.get(appid, {
+                    "appid": appid,
+                    "name": item.get("name", f"Steam app {appid}"),
+                    "folder": None,
+                    "available": False,
+                    "owned": True,
+                    "catalog_only": False,
+                })
+
+                game["owned"] = True
+                if item.get("name"):
+                    game["name"] = item["name"]
+
+                self.games[appid] = game
+
+            self.populate_games()
+            self.library_status.setText(
+                f"Account lookup complete · {len(self.games)} titles listed."
+            )
+
+        except Exception as exc:
+            QMessageBox.warning(self, "Steam API", str(exc))
+
+    # Encrypted packages
+
+    def package_selected(self):
+        game = self.selected_game()
+
+        if not game or not game.get("available") or not game.get("folder"):
+            QMessageBox.warning(
+                self, "Game unavailable",
+                "Only games with local files can be packaged."
+            )
+            return
+
+        if not self.password:
+            QMessageBox.warning(
+                self, "Locked", "Unlock GamePack before packaging."
+            )
+            return
+
+        safe_name = re.sub(
+            r"[^A-Za-z0-9 _.-]", "", game["name"]
+        ).strip() or "GamePack"
+
+        output, _ = QFileDialog.getSaveFileName(
+            self, "Save encrypted package", safe_name + ".gpk",
+            "GamePack archives (*.gpk)"
+        )
+
+        if not output:
+            return
+
+        if not output.lower().endswith(".gpk"):
+            output += ".gpk"
+
+        temporary = None
+
+        try:
+            temporary = tempfile.NamedTemporaryFile(
+                suffix=".tar.gz", delete=False
+            )
+            temporary.close()
+
+            root = Path(game["folder"]).resolve()
+
+            with tarfile.open(temporary.name, "w:gz") as archive:
+                for child in root.iterdir():
+                    archive.add(child, arcname=child.name, recursive=True)
+
+            data = Path(temporary.name).read_bytes()
+            Path(output).write_bytes(encrypt_bytes(data, self.password))
+
+            QMessageBox.information(
+                self, "Package created",
+                f"Encrypted package saved to:\n{output}\n\n"
+                "This archive does not transfer a Steam license."
+            )
+
+        except Exception as exc:
+            QMessageBox.critical(self, "Packaging failed", str(exc))
+
+        finally:
+            if temporary:
+                try:
+                    Path(temporary.name).unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    def open_package(self):
+        if not self.password:
+            QMessageBox.warning(
+                self, "Locked", "Unlock GamePack before opening packages."
+            )
+            return
+
+        source, _ = QFileDialog.getOpenFileName(
+            self, "Open GamePack archive", "",
+            "GamePack archives (*.gpk)"
+        )
+        if not source:
+            return
+
+        dest = QFileDialog.getExistingDirectory(
+            self, "Choose extraction folder"
+        )
+        if not dest:
+            return
+
+        temporary = None
+
+        try:
+            decrypted = decrypt_bytes(
+                Path(source).read_bytes(), self.password
+            )
+
+            temporary = tempfile.NamedTemporaryFile(
+                suffix=".tar.gz", delete=False
+            )
+            temporary.write(decrypted)
+            temporary.close()
+
+            base = Path(dest).resolve()
+
+            with tarfile.open(temporary.name, "r:gz") as archive:
+                members = archive.getmembers()
+
+                for member in members:
+                    target = (base / member.name).resolve()
+
+                    if target != base and base not in target.parents:
+                        raise ValueError(
+                            "Archive contains an unsafe file path."
+                        )
+
+                    if member.issym() or member.islnk() or member.isdev():
+                        raise ValueError(
+                            "Archive contains unsupported links."
+                        )
+
+                # Reject unsafe archive members before extracting.
+                try:
+                    archive.extractall(
+                        base, members=members, filter="data"
+                    )
+                except TypeError:
+                    # Older Python fallback. Path and link checks above
+                    # still apply, but use a current Python for best safety.
+                    archive.extractall(base, members=members)
+
+            QMessageBox.information(
+                self, "Extraction complete",
+                f"Files extracted to:\n{dest}"
+            )
+
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Could not open package", str(exc)
+            )
+
+        finally:
+            if temporary:
+                try:
+                    Path(temporary.name).unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    # Wallpaper and Theme Studio
+
+    def choose_background(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Choose wallpaper", str(Path.home()),
+            "Media (*.png *.jpg *.jpeg *.webp *.bmp *.mp4)"
+        )
+        if not path:
+            return
+
+        if path.lower().endswith(".mp4"):
+            if not MULTIMEDIA_AVAILABLE:
+                QMessageBox.warning(
+                    self, "Video playback",
+                    "Qt Multimedia is unavailable in this build."
+                )
+                return
+        elif QPixmap(path).isNull():
+            QMessageBox.warning(
+                self, "Wallpaper",
+                "The selected image could not be loaded."
+            )
+            return
+
+        self.background = path
+        self.rebuild_background()
+        self.save_preferences()
+
+    def clear_background(self):
+        self.background = ""
+        self.rebuild_background()
+        self.save_preferences()
+
+    def rebuild_background(self):
+        content = self.central_content
+        if content is None:
+            return
+
+        content.setParent(None)
+        old = self.takeCentralWidget()
+
+        if old:
+            if isinstance(old, BackgroundContainer):
+                old.stop()
+            old.deleteLater()
+
+        wrapper = self.make_background_layers(content)
+        self.setCentralWidget(wrapper)
+        self.apply_theme()
+
+    def choose_custom_color(self):
+        color = QColorDialog.getColor(QColor(self.custom_bg), self)
+        if not color.isValid():
+            return
+
+        self.custom_bg = color.name()
+        self.theme = "Custom"
+
+        if hasattr(self, "theme_combo"):
+            self.theme_combo.setCurrentText("Custom")
+
+        self.apply_theme()
+        self.save_preferences()
+
+    def change_theme(self, theme):
+        self.theme = theme
+        self.apply_theme()
+        self.save_preferences()
+
+    def toggle_effects(self, enabled):
+        self.effects = enabled
+
+        if self.background_layer:
+            self.background_layer.set_effects(enabled)
+
+        self.apply_theme()
+        self.save_preferences()
+
+    def toggle_transitions(self, enabled):
+        self.transitions = enabled
+        self.save_preferences()
+
+    def save_preferences(self, *_):
+        if hasattr(self, "duration_slider"):
+            self.duration_ms = self.duration_slider.value()
+
+        self.settings.update({
+            "theme": self.theme,
+            "custom_bg": self.custom_bg,
+            "custom_fg": self.custom_fg,
+            "background": self.background,
+            "effects": self.effects,
+            "transitions": self.transitions,
+            "duration_ms": self.duration_ms,
+        })
+
+        try:
+            save_settings(self.settings)
+        except OSError as exc:
+            QMessageBox.warning(self, "Settings", str(exc))
+
+    def apply_theme(self):
+        colors = (
+            LIGHT if self.theme == "Light"
+            else {
+                "bg": self.custom_bg,
+                "panel": self.custom_bg,
+                "fg": self.custom_fg,
+                "muted": self.custom_fg,
+                "accent": "#927bff",
+            } if self.theme == "Custom"
+            else DARK
+        )
+
+        glow_css = (
+            "QPushButton:hover {"
+            "border: 1px solid #a99aff;"
+            "background-color: rgba(117, 95, 230, 110);"
+            "}"
+            if self.effects else ""
+        )
+
+        self.setStyleSheet(f"""
+            QMainWindow {{
+                background: {colors['bg']};
+                color: {colors['fg']};
+            }}
+            QWidget {{
+                color: {colors['fg']};
+                font-family: "Segoe UI";
+                font-size: 10pt;
+            }}
+            QWidget#backgroundContainer {{
+                background: transparent;
+            }}
+            QWidget#page, QWidget#pages {{
+                background: transparent;
+                border: none;
+            }}
+            QFrame#sidebar {{
+                background: rgba(16, 19, 34, 210);
+                border-right: 1px solid {colors['accent']};
+            }}
+            QLabel {{
+                background: transparent;
+            }}
+            QLabel#heading {{
+                font-size: 23pt;
+                font-weight: 800;
+                border: none;
+            }}
+            QLabel#muted {{
+                color: {colors['muted']};
+            }}
+            QLabel#thumbnail {{
+                background: {colors['panel']};
+                border: 1px solid {colors['accent']};
+                border-radius: 12px;
+            }}
+            QPushButton {{
+                background: {colors['panel']};
+                border: 1px solid {colors['accent']};
+                border-radius: 9px;
+                padding: 10px 12px;
+                text-align: left;
+            }}
+            QPushButton[active="true"] {{
+                border: 2px solid {colors['accent']};
+                background: rgba(117, 95, 230, 105);
+                font-weight: 700;
+            }}
+            QPushButton:hover {{
+                background: {colors['accent']};
+            }}
+            QLineEdit, QTreeWidget, QComboBox {{
+                background: {colors['panel']};
+                border: 1px solid {colors['accent']};
+                border-radius: 6px;
+                padding: 7px;
+                selection-background-color: {colors['accent']};
+            }}
+            QTreeWidget::item {{
+                padding: 5px;
+            }}
+            QTreeWidget::item:selected {{
+                background: {colors['accent']};
+                border-radius: 4px;
+            }}
+            QCheckBox {{
+                spacing: 10px;
+                padding: 5px;
+            }}
+            QSlider::groove:horizontal {{
+                height: 5px;
+                background: {colors['panel']};
+                border-radius: 2px;
+            }}
+            QSlider::handle:horizontal {{
+                width: 15px;
+                margin: -5px 0;
+                border-radius: 7px;
+                background: {colors['accent']};
+            }}
+            {glow_css}
+        """)
+
+        if self.background_layer:
+            self.background_layer.set_effects(self.effects)
+
+    # Locking and shutdown
+
+    def lock_app(self):
+        self.password = None
+        self.build_gate()
+
+    def closeEvent(self, event):
+        old = self.centralWidget()
+
+        if isinstance(old, BackgroundContainer):
+            old.stop()
+
+        for worker in list(self.workers):
+            if worker.isRunning():
+                worker.quit()
+                if not worker.wait(1500):
+                    worker.wait()
+
+        event.accept()
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    app.setApplicationName(APP_NAME)
+
+    app_icon = QIcon(ICON_PATH) if Path(ICON_PATH).is_file() else QIcon()
+    app.setWindowIcon(app_icon)
+
+    window = GamePack()
+    window.setWindowIcon(app_icon)
+    window.show()
+
+    sys.exit(app.exec())
